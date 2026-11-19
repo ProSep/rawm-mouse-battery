@@ -1,0 +1,21 @@
+# Claude Code local state
+.claude/
+
+# kernel build artifacts
+*.o
+*.ko
+*.ko.zst
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+.module-common.o
+Module.symvers
+modules.order
+.tmp_versions/
+
+# python
+__pycache__/
+
+# private notes (contain device serials / machine details)
+*.private.md

@@ -1,0 +1,5 @@
+# hid-miracletek creates a silent input device that only advertises mouse
+# capabilities, so UPower classifies the battery as a mouse (it otherwise
+# guesses "keyboard" from the receiver's keyboard interface). It never sends
+# events; keep compositors / libinput from treating it as a pointer.
+SUBSYSTEM=="input", KERNELS=="miracletek-*", ENV{LIBINPUT_IGNORE_DEVICE}="1"

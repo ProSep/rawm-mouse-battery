@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""RAWKEEP — keep the Rawmtech LEVIATHAN V4 (1915:234a) working in wired mode.
+
+Background
+----------
+The Leviathan V4 in *wired* mode has a firmware quirk: it enumerates cleanly
+and answers the vendor protocol, but its mouse/keyboard input endpoints stay
+completely silent until something opens its **vendor HID interface**
+(interface 2, usage page 0xFF00). As soon as that interface is closed, the
+mouse goes dead again a short time later — which looks like "works for a
+second after plugging in, then stops".
+
+This daemon simply holds that interface open forever. Verified: opening it
+instantly revives the mouse (~3700 input events in 8 s vs 0 when closed), and
+closing it kills the mouse again.
+
+It is hotplug-aware: if the mouse is unplugged and replugged, it re-finds the
+new hidraw node and re-opens it.
+
+No root is needed: udev/70-rawm.rules gives the "input" group and the
+logged-in user access to the vendor interface. Read-only access is enough;
+nothing is ever written to the device.
+"""
+import os
+import sys
+import time
+import glob
+import select
+import signal
+
+VID, PID = 0x1915, 0x234a
+POLL_INTERVAL = 1.0          # how often to look for the device
+READ_CHUNK = 4096
+
+running = True
+
+
+def log(msg):
+    print("rawkeep: %s" % msg, flush=True)
+
+
+def is_vendor_interface(dev_dir):
+    """True if this HID interface is the vendor collection (usage page 0xFF00)."""
+    try:
+        with open(os.path.join(dev_dir, "report_descriptor"), "rb") as f:
+            head = f.read(3)
+        return head == bytes([0x06, 0x00, 0xff])
+    except OSError:
+        return False
+
+
+def find_vendor_hidraw():
+    """Return the /dev/hidrawN node of the wired mouse's vendor interface."""
+    for dev_dir in glob.glob("/sys/bus/hid/devices/*:%04X:%04X.*" % (VID, PID)):
+        if not is_vendor_interface(dev_dir):
+            continue
+        for node in glob.glob(os.path.join(dev_dir, "hidraw", "hidraw*")):
+            return "/dev/" + os.path.basename(node)
+    return None
+
+
+def hold(node):
+    """Hold the vendor node open. Return when it disappears or errors."""
+    log("holding %s open" % node)
+    try:
+        fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as e:
+        log("cannot open %s: %s" % (node, e))
+        return
+
+    try:
+        while running:
+            # Drain anything the interface sends; this keeps the endpoint
+            # actively serviced and is harmless.
+            r, _, _ = select.select([fd], [], [], POLL_INTERVAL)
+            if r:
+                try:
+                    os.read(fd, READ_CHUNK)
+                except OSError as e:
+                    log("read error, device likely gone: %s" % e)
+                    return
+            if not os.path.exists(node):
+                log("node disappeared")
+                return
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def main():
+    global running
+
+    def stop(*_):
+        global running
+        running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    log("started (watching %04x:%04x)" % (VID, PID))
+    while running:
+        node = find_vendor_hidraw()
+        if node is None:
+            time.sleep(POLL_INTERVAL)
+            continue
+        hold(node)
+        if running:
+            time.sleep(POLL_INTERVAL)
+    log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

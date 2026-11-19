@@ -1,0 +1,19 @@
+# RAWM (Rawmtech) devices: give the logged-in user access to the vendor HID
+# interface only (usage page 0xFF00, USB interface 2). Needed by the vendor's
+# WebHID configurator and by mouse-battery.py. NOT needed by the kernel driver.
+#
+# Must sort before 73-seat-late.rules, otherwise the uaccess tag is ignored.
+# The mouse/keyboard interfaces keep their default (root-only) permissions.
+# (Match the interface via ENV: all ATTRS{} in one rule must match the same
+# parent device, and idVendor and bInterfaceNumber live on different ones.)
+
+# RAWM HS Receiver (2.4 GHz dongle)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1915", ATTRS{idProduct}=="2346", \
+    ENV{ID_USB_INTERFACE_NUM}=="02", TAG+="uaccess"
+
+# LEVIATHAN V4 plugged in by cable (wired mode). rawkeep (see wired-mode/)
+# must hold this interface open or the mouse stops sending input. Group
+# "input" lets rawkeep open it before login too (the input group can already
+# read every keyboard and mouse, so this grants nothing new).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1915", ATTRS{idProduct}=="234a", \
+    ENV{ID_USB_INTERFACE_NUM}=="02", GROUP="input", MODE="0660", TAG+="uaccess"

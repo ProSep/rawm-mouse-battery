@@ -1,0 +1,17 @@
+[Unit]
+Description=Keep the Rawmtech LEVIATHAN V4 working in wired mode
+# No hard dependency on the device: the daemon waits for it to appear.
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rawkeep
+Restart=always
+RestartSec=2
+# Keep it lightweight and contained
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=32M
+
+[Install]
+WantedBy=default.target
