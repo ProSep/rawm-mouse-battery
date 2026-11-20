@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * HID battery driver for Rawmtech / RAWM wireless mice
- * (Leviathan V4 and siblings, receiver USB id 1915:2346).
+ * (Leviathan V4 and siblings, receiver USB id 1915:2346; the mouse itself
+ * enumerates as 1915:234a while it is plugged in by cable).
  *
  * Exposes the mouse battery through the kernel power_supply subsystem so it
  * shows up in UPower, desktop battery widgets, etc.
@@ -21,13 +22,21 @@
  *     {"dn":"LEVIATHAN V4","battery":35,"chr":0,...}
  * The mouse may also push NOTIFY (cmd 0xb) type 0x17: body[0] = percent,
  * body[1] == 1 -> charging.
+ *
+ * Wired mode: with the cable in, the mouse stops answering over the radio
+ * and instead speaks the same protocol on its own vendor interface, without
+ * the 0xC0|ch channel byte. The wired instance then tells every receiver
+ * instance to drop its (now stale) battery until the cable is removed, so
+ * userspace sees one battery with live charging data.
  */
 
 #include <linux/ctype.h>
 #include <linux/device.h>
 #include <linux/hid.h>
 #include <linux/input.h>
+#include <linux/list.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/power_supply.h>
 #include <linux/spinlock.h>
 #include <linux/timekeeping.h>
@@ -36,7 +45,12 @@
 #define DRV_NAME		"hid-miracletek"
 
 #define POLL_MS			60000
+#define RETRY_MS		10000	/* while no battery is registered */
 #define FIRST_POLL_MS		1000
+#define UNPLUG_POLL_MS		3000	/* radio needs a moment to relink */
+
+#define PID_RECEIVER		0x2346
+#define PID_WIRED_MOUSE		0x234a
 #define STALE_POLLS		5	/* no reply for this many polls -> unknown */
 #define REPORT_LEN		64
 #define STREAM_LEN		2048
@@ -61,6 +75,9 @@ struct miracletek_drvdata {
 	struct power_supply_desc battery_desc;
 	struct delayed_work poll_work;
 	struct work_struct register_work;
+	struct mutex reg_mutex;		/* serializes register vs. destroy */
+	struct list_head node;		/* on mt_receivers (receivers only) */
+	bool wired;			/* 1915:234a: the mouse on a cable */
 	bool opened;
 	char anchor_name[48];
 	char battery_name[64];
@@ -69,6 +86,7 @@ struct miracletek_drvdata {
 	spinlock_t lock;		/* protects everything below */
 	bool removing;
 	bool register_failed;		/* don't retry: avoids a retry storm */
+	bool suppressed;		/* receiver: mouse is wired, stay quiet */
 	u8 stream[STREAM_LEN];
 	size_t stream_len;
 	int capacity;			/* -1 = never read */
@@ -77,6 +95,11 @@ struct miracletek_drvdata {
 	bool got_reply;
 	char model[32];
 };
+
+/* Receiver instances, and how many wired mice are plugged in. */
+static DEFINE_MUTEX(mt_list_lock);
+static LIST_HEAD(mt_receivers);
+static unsigned int mt_wired_count;
 
 static enum power_supply_property miracletek_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
@@ -136,25 +159,32 @@ static int miracletek_get_property(struct power_supply *psy,
 
 /* ---- sending ---------------------------------------------------------- */
 
-static int miracletek_send_query(struct hid_device *hdev)
+static int miracletek_send_query(struct miracletek_drvdata *drv)
 {
+	struct hid_device *hdev = drv->hdev;
 	u64 ts = ktime_get_real_seconds();
-	u8 *buf;
+	u8 *buf, *m;
 	int i, ret;
 
 	buf = kzalloc(REPORT_LEN, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
-	buf[0] = PKT_EXTENDED | CH_MOUSE;
-	buf[1] = PKT_EVENT_DATA | 13;
-	buf[2] = CMD_QUERY;		/* | (len >> 4 & 0xf0) == 0 */
-	buf[3] = 13;			/* message length */
-	buf[4] = OS_PC;
-	buf[5] = 0;
-	buf[6] = 0;
+	if (drv->wired) {		/* talking to the mouse directly */
+		buf[0] = PKT_EVENT_DATA | 13;
+		m = buf + 1;
+	} else {			/* via the receiver, ESB channel 0 */
+		buf[0] = PKT_EXTENDED | CH_MOUSE;
+		buf[1] = PKT_EVENT_DATA | 13;
+		m = buf + 2;
+	}
+	m[0] = CMD_QUERY;		/* | (len >> 4 & 0xf0) == 0 */
+	m[1] = 13;			/* message length */
+	m[2] = OS_PC;
+	m[3] = 0;
+	m[4] = 0;
 	for (i = 0; i < 8; i++)
-		buf[7 + i] = (ts >> (8 * i)) & 0xff;
+		m[5 + i] = (ts >> (8 * i)) & 0xff;
 
 	ret = hid_hw_output_report(hdev, buf, REPORT_LEN);
 	kfree(buf);
@@ -301,20 +331,34 @@ static int miracletek_raw_event(struct hid_device *hdev,
 	struct miracletek_drvdata *drv = hid_get_drvdata(hdev);
 	unsigned long flags;
 	bool changed, need_register;
+	const u8 *payload;
 	size_t len;
 
 	if (!drv || size < 3)
 		return 0;
-	/* only channel-0 (mouse) data packets matter */
-	if (data[0] != (PKT_EXTENDED | CH_MOUSE) ||
-	    (data[1] & PKT_TYPE_MASK) != PKT_EVENT_DATA)
-		return 0;
-	len = min_t(size_t, data[1] & PKT_SIZE_MASK, size - 2);
+	if (drv->wired) {
+		/* the mouse itself: plain data packets, no channel byte */
+		if ((data[0] & PKT_TYPE_MASK) != PKT_EVENT_DATA)
+			return 0;
+		len = min_t(size_t, data[0] & PKT_SIZE_MASK, size - 1);
+		payload = data + 1;
+	} else {
+		/* receiver: only channel-0 (mouse) data packets matter */
+		if (data[0] != (PKT_EXTENDED | CH_MOUSE) ||
+		    (data[1] & PKT_TYPE_MASK) != PKT_EVENT_DATA)
+			return 0;
+		len = min_t(size_t, data[1] & PKT_SIZE_MASK, size - 2);
+		payload = data + 2;
+	}
 
 	spin_lock_irqsave(&drv->lock, flags);
+	if (drv->suppressed) {
+		spin_unlock_irqrestore(&drv->lock, flags);
+		return 0;
+	}
 	if (drv->stream_len + len > STREAM_LEN)
 		drv->stream_len = 0;		/* desync: start over */
-	memcpy(drv->stream + drv->stream_len, data + 2, len);
+	memcpy(drv->stream + drv->stream_len, payload, len);
 	drv->stream_len += len;
 	changed = miracletek_parse_stream(drv);
 	need_register = !drv->battery && drv->capacity >= 0 &&
@@ -424,10 +468,12 @@ static void miracletek_register_work(struct work_struct *work)
 	char id[32];
 	int ret;
 
+	mutex_lock(&drv->reg_mutex);
 	spin_lock_irqsave(&drv->lock, flags);
 	if (drv->battery || drv->anchor || drv->removing ||
-	    drv->register_failed) {
+	    drv->register_failed || drv->suppressed) {
 		spin_unlock_irqrestore(&drv->lock, flags);
+		mutex_unlock(&drv->reg_mutex);
 		return;
 	}
 	if (!drv->model[0])
@@ -464,14 +510,27 @@ static void miracletek_register_work(struct work_struct *work)
 	spin_lock_irqsave(&drv->lock, flags);
 	drv->battery = psy;
 	spin_unlock_irqrestore(&drv->lock, flags);
-	hid_info(hdev, "battery registered: %s (%d%%)\n",
-		 drv->model, drv->capacity);
+	hid_info(hdev, "battery registered: %s (%d%%%s)\n",
+		 drv->model, drv->capacity, drv->wired ? ", wired" : "");
+	mutex_unlock(&drv->reg_mutex);
 	return;
 fail:
 	miracletek_destroy_battery(drv);
 	spin_lock_irqsave(&drv->lock, flags);
 	drv->register_failed = true;
 	spin_unlock_irqrestore(&drv->lock, flags);
+	mutex_unlock(&drv->reg_mutex);
+}
+
+/* Forget everything read so far (used when a receiver goes quiet). */
+static void miracletek_reset_reading(struct miracletek_drvdata *drv)
+{
+	drv->stream_len = 0;
+	drv->capacity = -1;
+	drv->charging = false;
+	drv->missed_polls = 0;
+	drv->got_reply = false;
+	drv->model[0] = '\0';
 }
 
 static void miracletek_poll(struct work_struct *work)
@@ -479,8 +538,22 @@ static void miracletek_poll(struct work_struct *work)
 	struct miracletek_drvdata *drv =
 		container_of(work, struct miracletek_drvdata, poll_work.work);
 	unsigned long flags;
-	bool went_stale = false;
+	bool went_stale = false, suppressed, registered;
 	int ret;
+
+	spin_lock_irqsave(&drv->lock, flags);
+	suppressed = drv->suppressed;
+	spin_unlock_irqrestore(&drv->lock, flags);
+	if (suppressed) {
+		/* mouse is on a cable: its wired instance owns the battery */
+		mutex_lock(&drv->reg_mutex);
+		miracletek_destroy_battery(drv);
+		mutex_unlock(&drv->reg_mutex);
+		spin_lock_irqsave(&drv->lock, flags);
+		miracletek_reset_reading(drv);
+		spin_unlock_irqrestore(&drv->lock, flags);
+		return;		/* re-armed when the cable is removed */
+	}
 
 	spin_lock_irqsave(&drv->lock, flags);
 	if (!drv->got_reply && drv->missed_polls < STALE_POLLS) {
@@ -492,13 +565,32 @@ static void miracletek_poll(struct work_struct *work)
 		power_supply_changed(drv->battery);
 	spin_unlock_irqrestore(&drv->lock, flags);
 
-	ret = miracletek_send_query(drv->hdev);
+	ret = miracletek_send_query(drv);
 	if (ret)
 		hid_dbg(drv->hdev, "query failed: %d\n", ret);
 
+	spin_lock_irqsave(&drv->lock, flags);
+	registered = drv->battery != NULL;
+	spin_unlock_irqrestore(&drv->lock, flags);
+
 	/* long wq: the output report is a blocking USB transfer */
 	queue_delayed_work(system_long_wq, &drv->poll_work,
-			   msecs_to_jiffies(POLL_MS));
+			   msecs_to_jiffies(registered ? POLL_MS : RETRY_MS));
+}
+
+/* Called with mt_list_lock held: (un)silence every receiver instance. */
+static void miracletek_set_receivers_suppressed(bool on)
+{
+	struct miracletek_drvdata *rx;
+	unsigned long flags;
+
+	list_for_each_entry(rx, &mt_receivers, node) {
+		spin_lock_irqsave(&rx->lock, flags);
+		rx->suppressed = on;
+		spin_unlock_irqrestore(&rx->lock, flags);
+		mod_delayed_work(system_long_wq, &rx->poll_work,
+				 on ? 0 : msecs_to_jiffies(UNPLUG_POLL_MS));
+	}
 }
 
 /*
@@ -544,8 +636,11 @@ static int miracletek_probe(struct hid_device *hdev,
 		return -ENOMEM;
 	}
 	drv->hdev = hdev;
+	drv->wired = hdev->product == PID_WIRED_MOUSE;
 	drv->capacity = -1;
 	spin_lock_init(&drv->lock);
+	mutex_init(&drv->reg_mutex);
+	INIT_LIST_HEAD(&drv->node);
 	INIT_DELAYED_WORK(&drv->poll_work, miracletek_poll);
 	INIT_WORK(&drv->register_work, miracletek_register_work);
 	hid_set_drvdata(hdev, drv);
@@ -559,8 +654,21 @@ static int miracletek_probe(struct hid_device *hdev,
 	}
 	drv->opened = true;
 
+	mutex_lock(&mt_list_lock);
+	if (drv->wired) {
+		if (mt_wired_count++ == 0)
+			miracletek_set_receivers_suppressed(true);
+	} else {
+		unsigned long flags;
+
+		spin_lock_irqsave(&drv->lock, flags);
+		drv->suppressed = mt_wired_count > 0;
+		spin_unlock_irqrestore(&drv->lock, flags);
+		list_add(&drv->node, &mt_receivers);
+	}
 	queue_delayed_work(system_long_wq, &drv->poll_work,
 			   msecs_to_jiffies(FIRST_POLL_MS));
+	mutex_unlock(&mt_list_lock);
 	return 0;
 }
 
@@ -571,6 +679,17 @@ static void miracletek_remove(struct hid_device *hdev)
 	if (drv) {
 		unsigned long flags;
 
+		if (drv->opened) {
+			mutex_lock(&mt_list_lock);
+			if (drv->wired) {
+				if (--mt_wired_count == 0)
+					miracletek_set_receivers_suppressed(false);
+			} else {
+				list_del(&drv->node);
+			}
+			mutex_unlock(&mt_list_lock);
+		}
+
 		spin_lock_irqsave(&drv->lock, flags);
 		drv->removing = true;
 		spin_unlock_irqrestore(&drv->lock, flags);
@@ -578,13 +697,16 @@ static void miracletek_remove(struct hid_device *hdev)
 		if (drv->opened)
 			hid_hw_close(hdev);
 		cancel_work_sync(&drv->register_work);
+		mutex_lock(&drv->reg_mutex);
 		miracletek_destroy_battery(drv);
+		mutex_unlock(&drv->reg_mutex);
 	}
 	hid_hw_stop(hdev);
 }
 
 static const struct hid_device_id miracletek_devices[] = {
-	{ HID_USB_DEVICE(0x1915, 0x2346) },	/* RAWM HS Receiver */
+	{ HID_USB_DEVICE(0x1915, PID_RECEIVER) },	/* RAWM HS Receiver */
+	{ HID_USB_DEVICE(0x1915, PID_WIRED_MOUSE) },	/* Leviathan V4, cable */
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, miracletek_devices);

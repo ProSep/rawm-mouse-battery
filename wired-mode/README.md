@@ -16,6 +16,10 @@ about 3,700.
 
 ## Fix
 
+**If you use the `hid-miracletek` driver from this repository, you don't need
+anything here:** the driver binds the wired mouse too and keeps its vendor
+interface open. `rawkeep` is for anyone who wants the fix without the driver.
+
 `rawkeep` is a tiny daemon that finds the wired mouse's vendor hidraw node,
 opens it read-only, and holds it open. It handles unplug and replug.
 

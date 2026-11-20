@@ -23,15 +23,23 @@ the protocol here was reverse-engineered from that page's JavaScript.
 | Device | USB ID | Status |
 |---|---|---|
 | RAWM HS Receiver (2.4 GHz dongle) with **Leviathan V4** | `1915:2346` | Tested (receiver firmware G-2.0.3, mouse G-1.2.3) |
+| Leviathan V4 plugged in by cable (wired / charging) | `1915:234a` | Tested |
 
 Other RAWM mice that use the same `1915:2346` receiver will probably work too.
 The protocol is shared across RAWM's lineup, but they're untested; reports are
-welcome. Wired mode (the mouse plugged in directly, `1915:234a`) isn't handled,
-since the mouse is charging then anyway.
+welcome.
 
-**Wired mode on Linux has a separate problem:** the mouse stops responding a
-few seconds after you plug in the cable. [wired-mode/](wired-mode/) explains
-why and has a small fix.
+**While charging by cable**, the mouse stops answering over the radio and
+talks over USB instead. The driver then reads the battery from the cable
+connection, so you keep seeing a live percentage while it charges. The
+receiver's entry steps aside until you unplug; because the two connections
+report different serial numbers, UPower lists them as separate devices, but
+only one exists at a time.
+
+The driver also fixes a Linux-only wired-mode problem: without it, the mouse
+stops responding a few seconds after you plug in the cable.
+[wired-mode/](wired-mode/) explains why, and has a small userspace fix for
+anyone not using the driver.
 
 ## Install (DKMS)
 

@@ -117,3 +117,10 @@ The value moves in coarse steps.
   different vendor ID.
 - **Wired mode** has a separate firmware quirk: the mouse stops sending input
   unless its vendor interface is held open. See [wired-mode/](wired-mode/).
+- **With the cable in, the radio goes quiet.** The mouse stops answering
+  queries through the receiver and speaks the same protocol on its own vendor
+  interface (`1915:234a`, interface 2), without the `0xC0|ch` channel byte:
+  send `8d 01 0d 03 00 00 <ts>`, and replies arrive as plain `0x80|size`
+  packets. It reports `"chr":1` there and pushes NOTIFY `0x17` updates while
+  charging. An early version of the driver only polled the receiver, so the
+  percentage froze when the cable went in and disappeared five minutes later.
