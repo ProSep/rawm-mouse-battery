@@ -30,8 +30,8 @@ opens it read-only, and holds it open. It handles unplug and replug.
    sudo udevadm control --reload-rules
    ```
 
-   The rule gives the vendor interface to the `input` group and to the
-   logged-in user. Add yourself to `input` (`sudo usermod -aG input $USER`,
+   The rule gives the `input` group read access to the vendor interface
+   (all `rawkeep` needs) and the logged-in user read/write access. Add yourself to `input` (`sudo usermod -aG input $USER`,
    then log in again) if the mouse should also work at the login screen while
    `rawkeep` runs as a lingering user service.
 
@@ -48,7 +48,7 @@ opens it read-only, and holds it open. It handles unplug and replug.
    `holding /dev/hidrawN open`.
 
 A 2026 firmware update made the mouse last longer without `rawkeep` (around
-10–20 s instead of about 1 s), but it still stops, so `rawkeep` is still
+10–20 s instead of about 1 s), but it still stops, so without the driver `rawkeep` is still
 needed.
 
 ## Remove

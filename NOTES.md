@@ -111,8 +111,10 @@ The value moves in coarse steps.
 - **Don't toggle `authorized` on the receiver.** Doing that left it with no
   USB configuration (lit up but dead) until it was physically replugged.
 - **Only one program can drive the vendor channel at a time** from userspace
-  (the browser tool or the reader). The kernel driver doesn't conflict: it
-  passes every report on to hidraw.
+  (the browser tool or the reader). The kernel driver doesn't block them: it
+  passes every report on to hidraw. Its own queries (every 60 s, more often
+  while no battery is registered or a mouse is wired) share the same output
+  pipe, so a userspace reader can see QUERY_RESULT replies it didn't ask for.
 - **`hid-kysona`** (in-tree, for VXE/Kysona mice) doesn't apply: it matches a
   different vendor ID.
 - **Wired mode** has a separate firmware quirk: the mouse stops sending input
@@ -124,3 +126,6 @@ The value moves in coarse steps.
   packets. It reports `"chr":1` there and pushes NOTIFY `0x17` updates while
   charging. An early version of the driver only polled the receiver, so the
   percentage froze when the cable went in and disappeared five minutes later.
+  Now, while any mouse is wired, each receiver polls every 5 s and drops its
+  battery as soon as its mouse stops answering; a second mouse that still
+  answers over its own receiver keeps its battery.

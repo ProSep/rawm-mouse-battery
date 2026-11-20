@@ -11,9 +11,10 @@
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1915", ATTRS{idProduct}=="2346", \
     ENV{ID_USB_INTERFACE_NUM}=="02", TAG+="uaccess"
 
-# LEVIATHAN V4 plugged in by cable (wired mode). rawkeep (see wired-mode/)
-# must hold this interface open or the mouse stops sending input. Group
-# "input" lets rawkeep open it before login too (the input group can already
-# read every keyboard and mouse, so this grants nothing new).
+# LEVIATHAN V4 plugged in by cable (wired mode). The hid-miracletek driver
+# keeps this interface open by itself. Without the driver, rawkeep (see
+# wired-mode/) must hold it open or the mouse stops sending input; read-only
+# access for group "input" lets rawkeep do that before login too. Write
+# access (needed by the vendor tool) stays with the logged-in user.
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1915", ATTRS{idProduct}=="234a", \
-    ENV{ID_USB_INTERFACE_NUM}=="02", GROUP="input", MODE="0660", TAG+="uaccess"
+    ENV{ID_USB_INTERFACE_NUM}=="02", GROUP="input", MODE="0640", TAG+="uaccess"

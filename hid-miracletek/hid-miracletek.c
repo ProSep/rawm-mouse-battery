@@ -25,9 +25,11 @@
  *
  * Wired mode: with the cable in, the mouse stops answering over the radio
  * and instead speaks the same protocol on its own vendor interface, without
- * the 0xC0|ch channel byte. The wired instance then tells every receiver
- * instance to drop its (now stale) battery until the cable is removed, so
- * userspace sees one battery with live charging data.
+ * the 0xC0|ch channel byte. While any wired mouse is present, receivers
+ * query more often and drop their battery as soon as a query goes
+ * unanswered (that receiver's mouse is the one on the cable); a receiver
+ * whose mouse still answers keeps its battery. Userspace thus sees one
+ * battery per mouse, with live charging data while it is wired.
  */
 
 #include <linux/ctype.h>
@@ -48,6 +50,8 @@
 #define RETRY_MS		10000	/* while no battery is registered */
 #define FIRST_POLL_MS		1000
 #define UNPLUG_POLL_MS		3000	/* radio needs a moment to relink */
+#define WIRED_CHECK_MS		5000	/* receiver poll while a mouse is wired */
+#define VENDOR_IFACE_NUM	2
 
 #define PID_RECEIVER		0x2346
 #define PID_WIRED_MOUSE		0x234a
@@ -86,7 +90,7 @@ struct miracletek_drvdata {
 	spinlock_t lock;		/* protects everything below */
 	bool removing;
 	bool register_failed;		/* don't retry: avoids a retry storm */
-	bool suppressed;		/* receiver: mouse is wired, stay quiet */
+	bool wired_check;		/* receiver: a mouse is wired somewhere */
 	u8 stream[STREAM_LEN];
 	size_t stream_len;
 	int capacity;			/* -1 = never read */
@@ -352,10 +356,6 @@ static int miracletek_raw_event(struct hid_device *hdev,
 	}
 
 	spin_lock_irqsave(&drv->lock, flags);
-	if (drv->suppressed) {
-		spin_unlock_irqrestore(&drv->lock, flags);
-		return 0;
-	}
 	if (drv->stream_len + len > STREAM_LEN)
 		drv->stream_len = 0;		/* desync: start over */
 	memcpy(drv->stream + drv->stream_len, payload, len);
@@ -470,8 +470,9 @@ static void miracletek_register_work(struct work_struct *work)
 
 	mutex_lock(&drv->reg_mutex);
 	spin_lock_irqsave(&drv->lock, flags);
+	/* capacity < 0: the reading was reset while this work was queued */
 	if (drv->battery || drv->anchor || drv->removing ||
-	    drv->register_failed || drv->suppressed) {
+	    drv->register_failed || drv->capacity < 0) {
 		spin_unlock_irqrestore(&drv->lock, flags);
 		mutex_unlock(&drv->reg_mutex);
 		return;
@@ -522,9 +523,10 @@ fail:
 	mutex_unlock(&drv->reg_mutex);
 }
 
-/* Forget everything read so far (used when a receiver goes quiet). */
+/* Forget everything read so far. Called with drv->lock held. */
 static void miracletek_reset_reading(struct miracletek_drvdata *drv)
 {
+	drv->register_failed = false;
 	drv->stream_len = 0;
 	drv->capacity = -1;
 	drv->charging = false;
@@ -537,22 +539,33 @@ static void miracletek_poll(struct work_struct *work)
 {
 	struct miracletek_drvdata *drv =
 		container_of(work, struct miracletek_drvdata, poll_work.work);
-	unsigned long flags;
-	bool went_stale = false, suppressed, registered;
+	unsigned long flags, delay;
+	bool went_stale = false, wired_check, registered;
 	int ret;
 
+	/*
+	 * A mouse is plugged in by cable somewhere. If ours didn't answer the
+	 * last query, it is probably that one: its wired instance now reports
+	 * the battery, so drop ours instead of showing a frozen value.
+	 * Re-check and reset under reg_mutex: a register_work racing with us
+	 * waits for the mutex, then sees capacity < 0 and backs off.
+	 */
 	spin_lock_irqsave(&drv->lock, flags);
-	suppressed = drv->suppressed;
+	wired_check = drv->wired_check && !drv->got_reply &&
+		      (drv->battery || drv->capacity >= 0);
 	spin_unlock_irqrestore(&drv->lock, flags);
-	if (suppressed) {
-		/* mouse is on a cable: its wired instance owns the battery */
+	if (wired_check) {
 		mutex_lock(&drv->reg_mutex);
-		miracletek_destroy_battery(drv);
-		mutex_unlock(&drv->reg_mutex);
 		spin_lock_irqsave(&drv->lock, flags);
-		miracletek_reset_reading(drv);
+		wired_check = drv->wired_check && !drv->got_reply;
+		if (wired_check)
+			miracletek_reset_reading(drv);
 		spin_unlock_irqrestore(&drv->lock, flags);
-		return;		/* re-armed when the cable is removed */
+		if (wired_check) {
+			miracletek_destroy_battery(drv);
+			hid_info(drv->hdev, "mouse not answering by radio (cable in?), battery handed over\n");
+		}
+		mutex_unlock(&drv->reg_mutex);
 	}
 
 	spin_lock_irqsave(&drv->lock, flags);
@@ -571,22 +584,31 @@ static void miracletek_poll(struct work_struct *work)
 
 	spin_lock_irqsave(&drv->lock, flags);
 	registered = drv->battery != NULL;
+	wired_check = drv->wired_check;
 	spin_unlock_irqrestore(&drv->lock, flags);
 
+	if (wired_check)
+		delay = WIRED_CHECK_MS;
+	else
+		delay = registered ? POLL_MS : RETRY_MS;
 	/* long wq: the output report is a blocking USB transfer */
 	queue_delayed_work(system_long_wq, &drv->poll_work,
-			   msecs_to_jiffies(registered ? POLL_MS : RETRY_MS));
+			   msecs_to_jiffies(delay));
 }
 
-/* Called with mt_list_lock held: (un)silence every receiver instance. */
-static void miracletek_set_receivers_suppressed(bool on)
+/*
+ * Called with mt_list_lock held when the first wired mouse appears or the
+ * last one goes: tell every receiver to start or stop checking whether its
+ * mouse still answers, and poll it soon.
+ */
+static void miracletek_set_receivers_wired_check(bool on)
 {
 	struct miracletek_drvdata *rx;
 	unsigned long flags;
 
 	list_for_each_entry(rx, &mt_receivers, node) {
 		spin_lock_irqsave(&rx->lock, flags);
-		rx->suppressed = on;
+		rx->wired_check = on;
 		spin_unlock_irqrestore(&rx->lock, flags);
 		mod_delayed_work(system_long_wq, &rx->poll_work,
 				 on ? 0 : msecs_to_jiffies(UNPLUG_POLL_MS));
@@ -594,14 +616,18 @@ static void miracletek_set_receivers_suppressed(bool on)
 }
 
 /*
- * Only the vendor-defined interface (usage page 0xFF00) speaks the protocol;
- * the receiver exposes five interfaces with the same VID/PID.
+ * Only the vendor-defined interface (usage page 0xFF00, USB interface 2)
+ * speaks the protocol; the other interfaces share the same VID/PID.
  */
 static bool miracletek_is_vendor_iface(struct hid_device *hdev)
 {
 	struct hid_report_enum *renum = &hdev->report_enum[HID_INPUT_REPORT];
+	struct usb_interface *intf = to_usb_interface(hdev->dev.parent);
 	struct hid_report *rep;
 	int i;
+
+	if (intf->cur_altsetting->desc.bInterfaceNumber != VENDOR_IFACE_NUM)
+		return false;
 
 	list_for_each_entry(rep, &renum->report_list, list)
 		for (i = 0; i < rep->maxfield; i++)
@@ -657,12 +683,12 @@ static int miracletek_probe(struct hid_device *hdev,
 	mutex_lock(&mt_list_lock);
 	if (drv->wired) {
 		if (mt_wired_count++ == 0)
-			miracletek_set_receivers_suppressed(true);
+			miracletek_set_receivers_wired_check(true);
 	} else {
 		unsigned long flags;
 
 		spin_lock_irqsave(&drv->lock, flags);
-		drv->suppressed = mt_wired_count > 0;
+		drv->wired_check = mt_wired_count > 0;
 		spin_unlock_irqrestore(&drv->lock, flags);
 		list_add(&drv->node, &mt_receivers);
 	}
@@ -683,7 +709,7 @@ static void miracletek_remove(struct hid_device *hdev)
 			mutex_lock(&mt_list_lock);
 			if (drv->wired) {
 				if (--mt_wired_count == 0)
-					miracletek_set_receivers_suppressed(false);
+					miracletek_set_receivers_wired_check(false);
 			} else {
 				list_del(&drv->node);
 			}
